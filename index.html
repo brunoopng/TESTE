@@ -1937,102 +1937,88 @@ function makePeerConnection(){
 
 
 /* ====== PATCHED startCallFirestore (com tratamento de permission-denied + cleanup) ====== */
-async function startCallFirestore(peer){
-  if(!currentUser) return toast('Faça login');
-  if(!peer) return toast('Selecione um amigo');
-  if(currentCallRoom) return toast('Já em chamada');
 
-  try {
-    await ensureLocalAudioCall(); // pede permissão ao microfone
-  } catch(e) {
-    return toast('Microfone não disponível');
-  }
+// ====== Robust startCallFirestore implementation (injected) ======
+async function startCallFirestore(peerId){
+  try{
+    if(!peerId) return toast('Peer inválido');
+    // garante stream local
+    try{ await ensureLocalAudioCall(); } catch(e){ console.warn('microfone não disponível', e); return toast('Microfone não disponível'); }
 
-  const callRef = db.collection('calls').doc();
-  const callId = callRef.id;
-  currentCallRoom = callId;
-  btnCallPeer.disabled = true; // evita múltiplos cliques
-
-  try {
-    // metadata — se tiver auth você pode adicionar fromAuthUid
-    await callRef.set({
-      from: currentUser,
-      to: peer,
-      status: 'calling',
-      createdAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
-
-    // create pc and attach local tracks
-    makePeerConnection();
-    pc.role = 'caller';
-    localStreamCall.getTracks().forEach(t => pc.addTrack(t, localStreamCall));
-
-    // override onicecandidate to push to Firestore callerCandidates
-    pc.onicecandidate = (event) => {
-      if(!event.candidate) return;
-      callRef.collection('callerCandidates').add({ candidate: event.candidate.toJSON() }).catch(e => console.warn('add callerCandidate err', e));
-    };
-
-    // create offer
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    // save offer sdp to call doc
-    await callRef.update({ offer: { type: offer.type, sdp: offer.sdp } });
-
-    // listen for answer
-    const unsubAnswer = callRef.onSnapshot(async snap => {
-      const data = snap.data();
-      if(!data) return;
-      if(data.answer && pc && !pc.remoteDescription){
-        const remoteDesc = new RTCSessionDescription(data.answer);
-        try{ await pc.setRemoteDescription(remoteDesc); }catch(e){ console.warn('setRemoteDescription answer err', e); }
-      }
-      if(data.status === 'ended' || data.status === 'declined'){
-        hangupCallFirestore('remote');
-      }
-    }, err => {
-      console.error('callRef onSnapshot err', err);
-      if(err && err.code === 'permission-denied') {
-        toast('Firestore: permissões insuficientes ao escutar resposta. Ajuste regras.');
-      } else {
-        toast('Erro no listener da chamada: ' + (err.message || err));
-      }
-      // cleanup caso o listener falhe
-      try{ cleanupLocalCallState(); }catch(e){ console.warn('cleanup after onSnapshot err', e); }
-    });
-
-    // listen for callee ICE candidates
-    const unsubCalleeCandidates = callRef.collection('calleeCandidates').onSnapshot(snapshot=>{
-      snapshot.docChanges().forEach(ch=>{
-        if(ch.type === 'added'){
-          const cand = ch.doc.data().candidate;
-          try{ pc.addIceCandidate(new RTCIceCandidate(cand)); }catch(e){ console.warn('addIceCandidate(callee) err', e); }
-        }
-      });
-    }, err => {
-      console.error('calleeCandidates onSnapshot err', err);
-    });
-
-    firestoreUnsubs.push(unsubAnswer, unsubCalleeCandidates);
-
-    callStatusEl.style.display = 'inline-block';
-    callStatusEl.textContent = 'Chamando…';
-    showCallingUI(callId, peer);
-
-  } catch (err) {
-    console.error('startCallFirestore err ', err);
-    if(err && err.code === 'permission-denied'){
-      toast('Firestore: Permissão negada. Ajuste regras do Firestore (veja console).');
-    } else {
-      toast('Erro ao iniciar chamada: ' + (err.message || err));
+    // cria PeerConnection e assegura retorno
+    const _pc = makePeerConnection();
+    if(!_pc){
+      console.error('makePeerConnection retornou null');
+      return toast('Erro interno: não foi possível criar conexão');
     }
-    try{ cleanupLocalCallState(); }catch(e){ console.warn('cleanup after startCall err', e); }
-    btnCallPeer.disabled = false;
-    currentCallRoom = null;
-    try{ await callRef.delete().catch(()=>{}); }catch(e){}
+    window.pc = _pc;
+    try{ if(window.pc) window.pc.role = 'caller'; }catch(e){ console.warn('não foi possível setar pc.role', e); }
+
+    // garante que exista um transceiver de áudio (ajuda em alguns navegadores)
+    try{ ensureAudioTransceiver(window.pc); }catch(e){}
+
+    // adiciona tracks locais (somente se necessário)
+    try{
+      if(window.localStreamCall && window.localStreamCall.getTracks){
+        const senders = window.pc.getSenders();
+        window.localStreamCall.getTracks().forEach(track => {
+          const exists = senders.find(s => s.track && s.track.kind === track.kind);
+          if(!exists) {
+            try{ window.pc.addTrack(track, window.localStreamCall); }catch(e){ console.warn('addTrack err', e); }
+          } else {
+            try{ exists.replaceTrack(track).catch(()=>{}); }catch(_){}
+          }
+        });
+      }
+    }catch(e){ console.warn('erro ao anexar tracks locais', e); }
+
+    try{ ensureAudioTransceiver(window.pc); }catch(e){}
+
+    // create offer and set local description
+    let offer = null;
+    try{
+      offer = await window.pc.createOffer();
+      await window.pc.setLocalDescription(offer);
+    }catch(e){
+      console.error('Erro ao criar/apply offer', e);
+      return toast('Erro ao criar oferta de chamada: ' + (e && e.message ? e.message : e));
+    }
+
+    // persist offer to Firestore (if available)
+    const callPayload = { offer: { type: offer.type, sdp: offer.sdp }, from: currentUser || 'anon', to: peerId, createdAt: (typeof firebase !== 'undefined' ? firebase.firestore.FieldValue.serverTimestamp() : Date.now()), status: 'calling' };
+    let callRef = null;
+    if(typeof db !== 'undefined'){
+      try{
+        callRef = await db.collection('calls').add(callPayload);
+      }catch(e){
+        console.warn('Firestore add(call) falhou, tentando fallback', e);
+        try{
+          const id = 'call_' + Date.now().toString(36);
+          callRef = db.collection('calls').doc(id);
+          await callRef.set(callPayload, { merge: true });
+        }catch(e2){
+          console.error('Erro ao persistir chamada no Firestore', e2);
+          return toast('Erro ao iniciar chamada (persistência).');
+        }
+      }
+    } else {
+      window._lastLocalOffer = offer;
+    }
+
+    window._currentCallId = callRef ? (callRef.id || (callRef.path && callRef.path.split('/').pop())) : null;
+
+    // Update UI
+    try{ callStatusEl && (callStatusEl.textContent = 'Chamando…'); }catch(e){}
+    try{ showCallingUI(window._currentCallId, peerId); }catch(e){}
+
+    return window._currentCallId;
+  }catch(err){
+    console.error('startCallFirestore err', err);
+    toast('Erro ao iniciar chamada: '+(err && err.message?err.message:err));
   }
 }
+// ====== end startCallFirestore ======
+
 
 /* ====== PATCHED answerCallFirestore (mantive sua versão com pequenos ajustes) ====== */
 
@@ -2610,6 +2596,578 @@ if(wtLoadUrl && wtUrlInput && wtSource){
 
 <!-- remote audio element used by WebRTC -->
 <audio id="remoteAudio" autoplay playsinline style="display:none"></audio>
+
+
+<!-- BEGIN: Integrated Groups Feature (based on audio-fixed base) -->
+<style>
+/* Minimal styles that match the app palette */
+#grpCreateBtnSmall{background:var(--accent);color:var(--white);border:none;padding:6px 8px;border-radius:8px;cursor:pointer;font-size:13px;margin-left:8px}
+.group-modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:none;align-items:center;justify-content:center;z-index:10000}
+.group-modal{width:520px;background:var(--card);padding:18px;border-radius:12px;color:var(--white)}
+.group-members-list{max-height:260px;overflow:auto;border:1px solid rgba(255,255,255,0.03);padding:8px;border-radius:8px;background:rgba(255,255,255,0.01)}
+.member-row{display:flex;align-items:center;justify-content:space-between;padding:8px;border-radius:8px;margin-bottom:6px}
+.member-row .name{font-weight:600}
+.badge-group{background:rgba(11,116,255,0.12);color:var(--accent);padding:4px 8px;border-radius:999px;font-size:12px}
+.small-muted{font-size:13px;color:var(--muted)}
+</style>
+
+<!-- Button and Modal injected dynamically into friends list by script -->
+<div id="groupFeaturePlaceholders" style="display:none">
+  <div id="groupModalBackdrop" class="group-modal-backdrop" aria-hidden="true">
+    <div class="group-modal" role="dialog" aria-modal="true">
+      <h3 style="margin:0 0 8px 0">Criar novo grupo</h3>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div>
+          <label class="small-muted">Nome do grupo</label>
+          <input id="groupNameField" placeholder="Ex: Amigos" style="width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04)" />
+        </div>
+        <div>
+          <label class="small-muted">Selecionar amigos</label>
+          <div id="groupFriendsList" class="group-members-list" aria-live="polite">
+            <!-- friends rows added here -->
+          </div>
+          <div class="small-muted" style="margin-top:6px">Selecione amigos da sua lista. Você será automaticamente adicionado.</div>
+        </div>
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:6px">
+          <button id="groupCancelBtn" class="btn ghost">Cancelar</button>
+          <button id="groupCreateSubmitBtn" class="btn">Criar grupo</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  try{
+    // Utility to find friends list in your app (robust: checks several common IDs/classes)
+    const possibleSelectors = ['#friendsList', '#friends-list', '.friends-list', '#contactsList', '.contacts-list', '#friends'];
+    let friendsContainer = null;
+    for(const sel of possibleSelectors){
+      const el = document.querySelector(sel);
+      if(el){ friendsContainer = el; break; }
+    }
+    // If not found, try heuristics: find element that contains many items with data-user or data-uid
+    if(!friendsContainer){
+      const candidates = Array.from(document.querySelectorAll('div,ul')).filter(el=>{
+        const items = el.querySelectorAll('[data-user], [data-uid], .friend-item, .contact-item');
+        return items && items.length>=2;
+      });
+      if(candidates.length) friendsContainer = candidates[0];
+    }
+
+    // If still not found, create a minimal friends container in body (fallback)
+    if(!friendsContainer){
+      friendsContainer = document.createElement('div');
+      friendsContainer.id = 'friendsList';
+      friendsContainer.style.position = 'fixed';
+      friendsContainer.style.left = '12px';
+      friendsContainer.style.top = '80px';
+      friendsContainer.style.width = '240px';
+      friendsContainer.style.maxHeight = '60vh';
+      friendsContainer.style.overflow = 'auto';
+      friendsContainer.style.padding = '12px';
+      friendsContainer.style.background = 'linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01))';
+      friendsContainer.style.borderRadius = '10px';
+      document.body.appendChild(friendsContainer);
+    }
+
+    // Inject small "+ Grupo" button near the top of friends container
+    const headerBar = document.createElement('div');
+    headerBar.style.display = 'flex';
+    headerBar.style.alignItems = 'center';
+    headerBar.style.justifyContent = 'space-between';
+    headerBar.style.marginBottom = '8px';
+    const headerTitle = document.createElement('div');
+    headerTitle.textContent = 'Amigos';
+    headerTitle.style.fontWeight = '700';
+    headerTitle.style.fontSize = '14px';
+    headerBar.appendChild(headerTitle);
+    const btn = document.createElement('button');
+    btn.id = 'grpCreateBtnSmall';
+    btn.innerHTML = '+ Grupo';
+    headerBar.appendChild(btn);
+    // Insert headerBar as first child of friendsContainer
+    friendsContainer.insertBefore(headerBar, friendsContainer.firstChild);
+
+    // Move the modal markup into body (so it's not hidden inside templates), attach event handlers
+    const placeholder = document.getElementById('groupFeaturePlaceholders');
+    if(placeholder){
+      document.body.appendChild(placeholder);
+      placeholder.style.display = 'none';
+    }
+
+    // Elements
+    const modalBackdrop = document.getElementById('groupModalBackdrop');
+    const cancelBtn = document.getElementById('groupCancelBtn');
+    const createSubmit = document.getElementById('groupCreateSubmitBtn');
+    const groupNameField = document.getElementById('groupNameField');
+    const groupFriendsList = document.getElementById('groupFriendsList');
+
+    // Helper: Extract friends from existing DOM items in friendsContainer
+    function extractFriendsFromDOM(){
+      const seen = new Map();
+      // Check for elements with data-user or data-uid attributes
+      const nodes = friendsContainer.querySelectorAll('[data-user], [data-uid], .friend-item, .contact-item, li');
+      nodes.forEach(node=>{
+        // try to read id and name
+        let id = node.getAttribute('data-user') || node.getAttribute('data-uid') || null;
+        // fallback: look for child img with data-user
+        if(!id){
+          const img = node.querySelector('img[data-user], img[data-uid]');
+          if(img) id = img.getAttribute('data-user') || img.getAttribute('data-uid');
+        }
+        // fallback: text content
+        let name = (node.querySelector && node.querySelector('.name') && node.querySelector('.name').innerText) || node.getAttribute('data-name') || node.innerText || '';
+        name = name.trim().split('\\n')[0].trim();
+        if(!id){
+          // create synthetic id from name if absent (safe-uniq)
+          id = 'friend_' + name.replace(/\\s+/g,'_').toLowerCase();
+        }
+        if(!seen.has(id)){
+          seen.set(id, { id, name: name || id });
+        }
+      });
+      // If still empty, try to find global window.friends or similar
+      if(seen.size===0 && window.__friends && Array.isArray(window.__friends)){
+        window.__friends.forEach(f=> seen.set(f.id || f.uid || f.email || f.name, { id: f.id || f.uid || f.email || f.name, name: f.name || f.email || f.id }));
+      }
+      return Array.from(seen.values());
+    }
+
+    // Render friends list into modal with checkbox selection, deduped
+    function renderFriendsForModal(){
+      groupFriendsList.innerHTML = '';
+      const friends = extractFriendsFromDOM();
+      if(!friends.length){
+        groupFriendsList.innerHTML = '<div class="small-muted">Nenhum amigo encontrado na lista local.</div>';
+        return;
+      }
+      friends.forEach(f=>{
+        const row = document.createElement('div');
+        row.className = 'member-row';
+        row.innerHTML = '<div style="display:flex;align-items:center;gap:10px"><div class="name">'+escapeHtml(f.name)+'</div><div class="small-muted" style="font-size:12px">'+escapeHtml(f.id)+'</div></div><div><input type="checkbox" data-fid="'+escapeHtml(f.id)+'" /></div>';
+        groupFriendsList.appendChild(row);
+      });
+    }
+
+    function escapeHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    // Open modal
+    btn.addEventListener('click', ()=>{
+      renderFriendsForModal();
+      modalBackdrop.style.display = 'flex';
+      modalBackdrop.setAttribute('aria-hidden','false');
+      // focus name field
+      setTimeout(()=> groupNameField.focus(), 80);
+    });
+
+    // Close modal
+    cancelBtn.addEventListener('click', ()=>{
+      modalBackdrop.style.display = 'none';
+      modalBackdrop.setAttribute('aria-hidden','true');
+    });
+
+    // Helper: get selected member ids from modal checkboxes
+    function getSelectedMemberIds(){
+      const checks = groupFriendsList.querySelectorAll('input[type="checkbox"]:checked');
+      const ids = Array.from(checks).map(c=>c.getAttribute('data-fid')).filter(Boolean);
+      return ids;
+    }
+
+    // Add group visual entry into friendsContainer (avoid duplicates)
+    function addGroupEntryToFriendsList(groupId, groupName){
+      // check existing group entries by data-group-id
+      const existing = friendsContainer.querySelector('[data-group-id="'+groupId+'"]');
+      if(existing) return existing;
+      const el = document.createElement('div');
+      el.className = 'friend-item group-entry';
+      el.setAttribute('data-group-id', groupId);
+      el.style.display = 'flex';
+      el.style.alignItems = 'center';
+      el.style.justifyContent = 'space-between';
+      el.style.padding = '8px';
+      el.style.borderRadius = '8px';
+      el.style.marginBottom = '6px';
+      el.style.background = 'rgba(255,255,255,0.01)';
+      el.innerHTML = '<div><strong>'+escapeHtml(groupName)+'</strong><div class="small-muted">Grupo</div></div><div class="badge-group">Grupo</div>';
+      // clicking opens group chat (attempt to reuse existing openGroup or fallback)
+      el.addEventListener('click', ()=>{
+        // prefer existing openGroup if defined earlier in your app
+        if(typeof openGroup === 'function'){ openGroup(groupId); return; }
+        // else try to set activeGroupTitle and load messages into #chatWindow if present
+        const chatWindow = document.getElementById('chatWindow');
+        if(chatWindow){
+          // load messages one-time and then subscribe
+          chatWindow.innerHTML = '<div class="small-muted">Carregando grupo...</div>';
+          if(typeof db !== 'undefined'){
+            db.collection('groups').doc(groupId).get().then(d=>{
+              if(!d.exists) return;
+              const data = d.data();
+              const hdr = document.getElementById('activeGroupTitle'); if(hdr) hdr.textContent = data.name || 'Grupo';
+              const sub = document.getElementById('activeGroupSub'); if(sub) sub.textContent = ((data.members||[]).length)+' membros';
+            }).catch(e=>console.warn(e));
+            // subscribe
+            db.collection('groups').doc(groupId).collection('messages').orderBy('ts','asc')
+              .onSnapshot(snap=>{
+                chatWindow.innerHTML = '';
+                snap.forEach(doc=>{
+                  const m = doc.data();
+                  const div = document.createElement('div');
+                  div.className = 'message' + ((m.from === (window.currentUser || '')) ? ' me' : '');
+                  div.innerHTML = '<div style="font-size:13px;font-weight:600">'+escapeHtml(m.from||'')+'</div><div style="margin-top:6px">'+escapeHtml(m.text||'')+'</div>';
+                  chatWindow.appendChild(div);
+                });
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+              }, err=>console.warn(err));
+          } else {
+            chatWindow.innerHTML = '<div class="small-muted">Firestore não disponível para carregar mensagens.</div>';
+          }
+        }
+      });
+      // insert after headerBar (which we added as first child)
+      const headerBar = friendsContainer.firstChild;
+      if(headerBar) friendsContainer.insertBefore(el, headerBar.nextSibling);
+      else friendsContainer.appendChild(el);
+      return el;
+    }
+
+    // Create group: robust, dedupe, Firestore-safe, fallback localStorage
+    createSubmit.addEventListener('click', async ()=>{
+      const name = (groupNameField.value || '').trim();
+      if(!name) return alert('Defina um nome para o grupo');
+      let members = getSelectedMemberIds() || [];
+      // ensure currentUser is included (if available)
+      const me = window.currentUser || (window.user && window.user.id) || null;
+      if(me && !members.includes(me)) members.unshift(me);
+      // dedupe preserving order
+      const deduped = [];
+      const seen = new Set();
+      for(const m of members){ if(!seen.has(m)){ deduped.push(m); seen.add(m); } }
+      members = deduped;
+      if(members.length < 1) return alert('Selecione ao menos um membro');
+      // build payload
+      const payload = { name, members, creator: me || 'unknown', createdAt: (typeof firebase !== 'undefined' ? firebase.firestore.FieldValue.serverTimestamp() : Date.now()) };
+      // Try Firestore first
+      if(typeof db !== 'undefined' && typeof firebase !== 'undefined'){
+        try{
+          const ref = await db.collection('groups').add(payload);
+          // add initial system message
+          try{ await db.collection('groups').doc(ref.id).collection('messages').add({ from: 'system', text: 'Grupo criado', ts: firebase.firestore.FieldValue.serverTimestamp() }); }catch(e){ console.warn('initial message err', e); }
+          addGroupEntryToFriendsList(ref.id, name);
+          modalBackdrop.style.display = 'none'; modalBackdrop.setAttribute('aria-hidden','true');
+          groupNameField.value = '';
+        }catch(e){
+          console.error('Firestore create group err', e);
+          alert('Erro ao criar grupo (FireStore): ' + (e && e.message ? e.message : e));
+        }
+        return;
+      }
+      // Fallback: localStorage
+      try{
+        const localKey = 'local_groups_v1';
+        const existing = JSON.parse(localStorage.getItem(localKey) || '[]');
+        const id = 'local_' + Date.now().toString(36);
+        existing.push(Object.assign({ id }, payload));
+        localStorage.setItem(localKey, JSON.stringify(existing));
+        addGroupEntryToFriendsList(id, name);
+        modalBackdrop.style.display = 'none'; modalBackdrop.setAttribute('aria-hidden','true');
+        groupNameField.value = '';
+        alert('Grupo criado localmente (sem Firestore).');
+      }catch(e){
+        console.error('local create group err', e);
+        alert('Erro ao criar grupo localmente');
+      }
+    });
+
+    // Subscribe to groups where currentUser is a member (avoid duplicates)
+    function subscribeMyGroups(){
+      const me = window.currentUser || (window.user && window.user.id) || null;
+      if(!me) return;
+      if(typeof db === 'undefined') return;
+      try{
+        db.collection('groups').where('members','array-contains', me).onSnapshot(snap=>{
+          snap.forEach(doc=>{
+            const d = doc.data();
+            addGroupEntryToFriendsList(doc.id, d.name || 'Grupo');
+          });
+        }, err=> console.warn('subscribeMyGroups err', err));
+      }catch(e){ console.warn('subscribeMyGroups catch', e); }
+    }
+
+    // Initialize subscription and also load local groups (fallback)
+    setTimeout(()=>{
+      subscribeMyGroups();
+      // load local stored groups if any
+      try{
+        const localKey = 'local_groups_v1';
+        const existing = JSON.parse(localStorage.getItem(localKey) || '[]');
+        existing.forEach(g=> addGroupEntryToFriendsList(g.id, g.name));
+      }catch(e){}
+    }, 400);
+
+  }catch(err){
+    console.warn('Integrated groups init err', err);
+  }
+})();
+</script>
+<!-- END: Integrated Groups Feature -->
+
+
+<!-- BEGIN: Ensure group button appears (robust) -->
+<script>
+(function(){
+  try{
+    function createHeaderButton(friendsContainer){
+      if(!friendsContainer) return null;
+      // don't add multiple times
+      if(friendsContainer.querySelector('#grpCreateBtnSmall')) return friendsContainer.querySelector('#grpCreateBtnSmall');
+      // Create header bar if not present
+      let firstChild = friendsContainer.firstElementChild;
+      let headerBar = null;
+      if(firstChild && firstChild.classList && (firstChild.classList.contains('header') || firstChild.classList.contains('friends-header') || firstChild.querySelector('#grpCreateBtnSmall'))) {
+        headerBar = firstChild;
+      } else {
+        headerBar = document.createElement('div');
+        headerBar.style.display = 'flex';
+        headerBar.style.alignItems = 'center';
+        headerBar.style.justifyContent = 'space-between';
+        headerBar.style.marginBottom = '8px';
+        headerBar.className = 'friends-header';
+        const title = document.createElement('div');
+        title.textContent = 'Amigos';
+        title.style.fontWeight = '700';
+        title.style.fontSize = '14px';
+        headerBar.appendChild(title);
+      }
+      // create button if missing
+      if(!headerBar.querySelector('#grpCreateBtnSmall')){
+        const btn = document.createElement('button');
+        btn.id = 'grpCreateBtnSmall';
+        btn.innerHTML = '+ Grupo';
+        btn.style.background = getComputedStyle(document.documentElement).getPropertyValue('--accent') || '#0b74ff';
+        btn.style.color = 'white';
+        btn.style.border = 'none';
+        btn.style.padding = '6px 8px';
+        btn.style.borderRadius = '8px';
+        btn.style.cursor = 'pointer';
+        btn.style.fontSize = '13px';
+        btn.style.marginLeft = '8px';
+        btn.className = 'grp-create-inline';
+        btn.addEventListener('click', ()=>{
+          const modal = document.getElementById('groupModalBackdrop');
+          if(modal){ modal.style.display='flex'; modal.setAttribute('aria-hidden','false'); const f = document.getElementById('groupNameField'); if(f) f.focus(); }
+          else alert('Modal de grupo não encontrado.');
+        });
+        headerBar.appendChild(btn);
+      }
+      // insert headerBar as first child if not present
+      if(friendsContainer.firstElementChild !== headerBar){
+        friendsContainer.insertBefore(headerBar, friendsContainer.firstChild);
+      }
+      return headerBar.querySelector('#grpCreateBtnSmall');
+    }
+
+    function tryInsertIntoKnownPlaces(){
+      const selectors = ['#friendsList','#friends-list','.friends-list','#contactsList','.contacts-list','#friends','.sidebar .friends'];
+      for(const sel of selectors){
+        const el = document.querySelector(sel);
+        if(el){
+          createHeaderButton(el);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // Try immediate insertion
+    if(tryInsertIntoKnownPlaces()){
+      // done
+    } else {
+      // Watch for DOM changes to catch late-rendered friends list
+      const observer = new MutationObserver((mutations, obs)=>{
+        if(tryInsertIntoKnownPlaces()){
+          obs.disconnect();
+        }
+      });
+      observer.observe(document.body, { childList:true, subtree:true });
+      // As fallback, add small floating button in top-left after 1.2s so user can open modal even if friends list not found
+      setTimeout(()=>{
+        if(!document.getElementById('grpCreateBtnSmall')){
+          const fallback = document.createElement('button');
+          fallback.id = 'grpCreateBtnSmall';
+          fallback.innerHTML = '+ Grupo';
+          fallback.style.position = 'fixed';
+          fallback.style.left = '12px';
+          fallback.style.top = '12px';
+          fallback.style.zIndex = 99999;
+          fallback.style.background = getComputedStyle(document.documentElement).getPropertyValue('--accent') || '#0b74ff';
+          fallback.style.color = 'white';
+          fallback.style.border = 'none';
+          fallback.style.padding = '8px 10px';
+          fallback.style.borderRadius = '10px';
+          fallback.style.cursor = 'pointer';
+          fallback.addEventListener('click', ()=>{
+            const modal = document.getElementById('groupModalBackdrop');
+            if(modal){ modal.style.display='flex'; modal.setAttribute('aria-hidden','false'); const f = document.getElementById('groupNameField'); if(f) f.focus(); }
+            else alert('Modal de grupo não encontrado.');
+          });
+          document.body.appendChild(fallback);
+        }
+      }, 1200);
+    }
+  }catch(e){
+    console.warn('ensure group button err', e);
+  }
+})();
+</script>
+<!-- END: Ensure group button appears (robust) -->
+
+
+<!-- BEGIN: Ensure +Grupo robust v2 -->
+<script>
+(function(){
+  try{
+    const FRIEND_SELECTORS = ['#friendsList','#friends-list','.friends-list','#contactsList','.contacts-list','#friends'];
+    const BUTTON_ID = 'grpCreateBtnSmall_v2';
+    const GROUP_ENTRY_ATTR = 'data-group-id';
+
+    function findFriendsContainer(){
+      for(const s of FRIEND_SELECTORS){
+        const el = document.querySelector(s);
+        if(el) return el;
+      }
+      const candidates = Array.from(document.querySelectorAll('div,ul')).filter(el=>{
+        const cnt = el.querySelectorAll('[data-user],[data-uid],.friend-item,.contact-item,li').length;
+        return cnt >= 2 && el.clientHeight > 10;
+      });
+      return candidates[0] || null;
+    }
+
+    function createButtonNode(){
+      const btn = document.createElement('button');
+      btn.id = BUTTON_ID;
+      btn.innerText = '+';
+      btn.style.width = '36px';
+      btn.style.height = '36px';
+      btn.style.borderRadius = '50%';
+      btn.style.background = getComputedStyle(document.documentElement).getPropertyValue('--white') || '#fff';
+      btn.style.color = getComputedStyle(document.documentElement).getPropertyValue('--bg') || '#000';
+      btn.style.border = '1px solid rgba(255,255,255,0.06)';
+      btn.style.display = 'inline-flex';
+      btn.style.alignItems = 'center';
+      btn.style.justifyContent = 'center';
+      btn.style.cursor = 'pointer';
+      btn.style.fontWeight = '700';
+      btn.style.fontSize = '18px';
+      btn.title = 'Criar grupo';
+      btn.addEventListener('click', ()=>{
+        const modal = document.getElementById('groupModalBackdrop') || document.getElementById('groupModalBackdrop_v2') || null;
+        if(modal){ modal.style.display='flex'; modal.setAttribute('aria-hidden','false'); const f = document.getElementById('groupNameField'); if(f) f.focus(); }
+        else alert('Modal de criar grupo não encontrado.');
+      });
+      return btn;
+    }
+
+    function insertButtonIntoContainer(container){
+      if(!container) return;
+      if(container.querySelector('#'+BUTTON_ID)) return;
+      let header = container.querySelector('.friends-header, .header, .list-header');
+      if(!header){
+        header = document.createElement('div');
+        header.className = 'friends-header';
+        header.style.display = 'flex';
+        header.style.alignItems = 'center';
+        header.style.justifyContent = 'space-between';
+        header.style.marginBottom = '8px';
+        const t = document.createElement('div'); t.innerText = 'Amigos'; t.style.fontWeight = '700';
+        header.appendChild(t);
+      }
+      const btn = createButtonNode();
+      header.appendChild(btn);
+      if(container.firstElementChild !== header){
+        container.insertBefore(header, container.firstChild);
+      }
+    }
+
+    function observeAndEnsure(){
+      const container = findFriendsContainer();
+      if(container){
+        insertButtonIntoContainer(container);
+
+        const mo = new MutationObserver((muts)=>{
+          if(!container.querySelector('#'+BUTTON_ID)) insertButtonIntoContainer(container);
+          const knownGroups = window.__my_group_entries_cache || {};
+          Object.keys(knownGroups).forEach(gid=>{
+            if(!container.querySelector('['+GROUP_ENTRY_ATTR+'=\"'+gid+'\"]')){
+              const el = createGroupEntryNode(gid, knownGroups[gid]);
+              const header = container.firstElementChild;
+              if(header) container.insertBefore(el, header.nextSibling);
+              else container.appendChild(el);
+            }
+          });
+        });
+        mo.observe(container, { childList:true, subtree:true });
+      } else {
+        const bodyObs = new MutationObserver((muts, obs)=>{
+          const c = findFriendsContainer();
+          if(c){ obs.disconnect(); observeAndEnsure(); }
+        });
+        bodyObs.observe(document.body, { childList:true, subtree:true });
+        setTimeout(()=>{ if(!document.getElementById(BUTTON_ID)){ const fb = createButtonNode(); fb.style.position='fixed'; fb.style.left='16px'; fb.style.top='16px'; fb.style.zIndex=99999; fb.style.background = 'var(--white)'; fb.style.color = 'var(--bg)'; document.body.appendChild(fb); } }, 1200);
+      }
+    }
+
+    function createGroupEntryNode(groupId, groupName){
+      const el = document.createElement('div');
+      el.setAttribute(GROUP_ENTRY_ATTR, groupId);
+      el.className = 'friend-item group-entry';
+      el.style.display = 'flex';
+      el.style.alignItems = 'center';
+      el.style.justifyContent = 'space-between';
+      el.style.padding = '8px';
+      el.style.borderRadius = '8px';
+      el.style.marginBottom = '6px';
+      el.style.background = 'rgba(255,255,255,0.01)';
+      el.innerHTML = '<div><strong>'+escapeHtml(groupName)+'</strong><div class=\"small-muted\">Grupo</div></div><div style=\"background:rgba(11,116,255,0.12);color:var(--accent);padding:4px 8px;border-radius:999px;font-size:12px\">Grupo</div>';
+      el.addEventListener('click', ()=>{ if(typeof openGroup === 'function'){ openGroup(groupId); return; } const chatWindow = document.getElementById('chatWindow'); if(chatWindow){ const ev = new CustomEvent('openGroupFromList', { detail: { groupId } }); window.dispatchEvent(ev); } });
+      return el;
+    }
+
+    function escapeHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    window.__my_group_entries_cache = window.__my_group_entries_cache || {};
+
+    function subscribeAndPopulateGroups(){
+      const me = window.currentUser || (window.user && window.user.id) || null;
+      if(!me || typeof db === 'undefined') return;
+      try{
+        db.collection('groups').where('members','array-contains', me).onSnapshot(snap=>{
+          snap.forEach(doc=>{
+            const id = doc.id;
+            const data = doc.data() || {};
+            const name = data.name || 'Grupo';
+            window.__my_group_entries_cache[id] = name;
+            const container = findFriendsContainer();
+            if(container && !container.querySelector('['+GROUP_ENTRY_ATTR+'=\"'+id+'\"]')){
+              const header = container.firstElementChild;
+              const node = createGroupEntryNode(id, name);
+              if(header) container.insertBefore(node, header.nextSibling);
+              else container.appendChild(node);
+            }
+          });
+        }, err=> console.warn('subscribe groups err', err));
+      }catch(e){ console.warn('subscribeAndPopulateGroups err', e); }
+    }
+
+    observeAndEnsure();
+    setTimeout(subscribeAndPopulateGroups, 400);
+  }catch(e){
+    console.warn('ensure+groups bootstrap err', e);
+  }
+})();
+</script>
+<!-- END: Ensure +Grupo robust v2 -->
 
 </body>
 </html>
